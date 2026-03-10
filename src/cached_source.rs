@@ -215,16 +215,64 @@ impl Chunks for CachedSourceChunks<'_> {
         }
       }
       None => {
-        let (generated_info, map) = stream_and_get_source_and_map(
+        // BUG FIX: Swallow all callbacks, cache the map, then replay.
+        //
+        // The old code forwarded on_chunk/on_source/on_name directly
+        // during stream_and_get_source_and_map(). This caused
+        // non-deterministic .js.map output — entire source modules
+        // randomly appeared or disappeared between builds:
+        //
+        //   Build 1 .js.map sources:       Build 2 .js.map sources:
+        //     [0] "src/moduleA.js"            [0] "src/moduleA.js"
+        //     [1] "src/moduleB.js"            [1] "src/moduleB.js"
+        //     [2] "react-redux/types.js"      [2] "src/moduleC.js"
+        //     [3] "src/moduleC.js"            ← types.js dropped
+        //
+        // The exact mechanism is unclear — the callback chain from
+        // stream_and_get_source_and_map through nested sources
+        // (ConcatSource → CachedSource → SourceMapSource) involves
+        // multiple layers of callback wrapping and source index
+        // remapping (see stream_chunks_of_combined_source_map in
+        // helpers.rs, which lazily registers sources inside on_chunk
+        // handlers at line ~1050). Somewhere in this chain, the
+        // forwarded-callback path produces different output than the
+        // cached-map-replay path.
+        //
+        // Fix: swallow all callbacks during the initial computation
+        // (just compute and cache the map), then replay from the
+        // cached map using stream_chunks_of_source_map. This makes
+        // the cache-miss path identical to the cache-hit path,
+        // eliminating the non-determinism.
+        let (_generated_info, map) = stream_and_get_source_and_map(
           options,
           object_pool,
           self.chunks.as_ref(),
-          on_chunk,
-          on_source,
-          on_name,
+          &mut |_, _| {},
+          &mut |_, _, _| {},
+          &mut |_, _| {},
         );
         cell.get_or_init(|| map);
-        generated_info
+
+        // Replay from the cached map (same codepath as the cached hit above).
+        if let Some(Some(map)) = cell.get() {
+          stream_chunks_of_source_map(
+            options,
+            object_pool,
+            self.source.as_ref(),
+            map,
+            on_chunk,
+            on_source,
+            on_name,
+          )
+        } else {
+          stream_chunks_of_raw_source(
+            self.source.as_ref(),
+            options,
+            on_chunk,
+            on_source,
+            on_name,
+          )
+        }
       }
     }
   }
